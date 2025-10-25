@@ -1,0 +1,7 @@
+Web server framework
+
+Flask
+
+Production WSGI server for Render deployment
+
+gunicorn
