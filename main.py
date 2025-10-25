@@ -1,15 +1,25 @@
 import os
 import uuid
 import subprocess
-from flask import Flask, request, send_file
-from io import BytesIO
+import logging
+from flask import Flask, request, send_file, jsonify
+
+# --- Configuration and Initialization ---
 
 # Initialize Flask App
 app = Flask(__name__)
 
+# Configure logging for better debugging and error visibility
+logging.basicConfig(level=logging.INFO)
+
 # Directory for temporary file storage
 TEMP_DIR = '/tmp'
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+# SECURITY/RELIABILITY: Limit the maximum file size for uploads to 100MB 
+# to prevent resource exhaustion (DoS attack)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024 
+
 
 @app.route('/compress', methods=['POST'])
 def compress_audio():
@@ -17,33 +27,35 @@ def compress_audio():
     Handles file upload, compresses audio using FFmpeg, and returns the compressed file.
     The primary goal is to reduce file size below 25MB for the Groq Whisper API.
     """
-    if 'file' not in request.files:
-        return {"error": "No file part in the request"}, 400
-
-    uploaded_file = request.files['file']
-    if uploaded_file.filename == '':
-        return {"error": "No selected file"}, 400
-
-    # 1. Save the incoming file to a temporary location
-    unique_id = uuid.uuid4()
     
-    # Use the original content type for the input file extension (e.g., .mp4, .ogg)
-    content_type = uploaded_file.content_type 
-    input_ext = os.path.splitext(uploaded_file.filename)[1] or '.mp4' 
-    if not input_ext:
-        # Fallback for Blobs without explicit filename/extension
-        input_ext = '.' + content_type.split('/')[-1] if '/' in content_type else '.mp4'
-
-    input_path = os.path.join(TEMP_DIR, f'input_{unique_id}{input_ext}')
-    output_path = os.path.join(TEMP_DIR, f'output_{unique_id}.mp3')
+    # Initialize paths to None for safe cleanup in the finally block
+    input_path = None
+    output_path = None
 
     try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file part in the request"}), 400
+
+        uploaded_file = request.files['file']
+        if uploaded_file.filename == '':
+            return jsonify({"error": "No selected file"}), 400
+
+        # 1. Save the incoming file to a temporary location
+        unique_id = uuid.uuid4()
+        
+        # SECURITY FIX: Do not use the user-provided filename extension.
+        # Instead, force a generic, non-executable, temporary extension (.bin)
+        # FFmpeg is robust enough to detect the actual format from the file contents.
+        input_path = os.path.join(TEMP_DIR, f'input_{unique_id}.bin')
+        output_path = os.path.join(TEMP_DIR, f'output_{unique_id}.mp3')
+
         # Save the file stream to disk
         uploaded_file.save(input_path)
         app.logger.info(f"Saved file to {input_path}")
         
         # 2. Execute FFmpeg Command for Audio Downscaling
-        # Command: -i (input) 
+        # Command: 
+        # -i (input) 
         # -vn (no video) 
         # -c:a libmp3lame (codec for MP3) 
         # -b:a 64k (target bitrate: 64kbps, significantly reduces size)
@@ -58,14 +70,17 @@ def compress_audio():
         ]
         
         # Run the FFmpeg process
+        # RELIABILITY FIX: Added 'timeout=180' to prevent indefinite execution 
+        # on corrupted or overly long files.
         process = subprocess.run(command, 
                                  capture_output=True, 
                                  text=True,
-                                 check=False) # check=False allows us to handle errors manually
+                                 check=False,
+                                 timeout=180) 
 
         if process.returncode != 0:
             app.logger.error(f"FFmpeg Error: {process.stderr}")
-            return {"error": "FFmpeg compression failed", "details": process.stderr}, 500
+            return jsonify({"error": "FFmpeg compression failed", "details": process.stderr}), 500
 
         # 3. Read the compressed file back into memory and serve it
         app.logger.info(f"FFmpeg compression successful. Output file: {output_path}")
@@ -75,18 +90,25 @@ def compress_audio():
                          as_attachment=True,
                          download_name='compressed_audio.mp3')
 
+    except TimeoutError:
+        app.logger.error("FFmpeg process timed out after 180 seconds.")
+        return jsonify({"error": "Processing took too long and was aborted."}), 504
+    
     except Exception as e:
         app.logger.error(f"Internal Server Error: {e}")
-        return {"error": "Internal server error during processing"}, 500
+        return jsonify({"error": "Internal server error during processing"}), 500
 
     finally:
         # 4. Clean up temporary files
+        # RELIABILITY FIX: Check if paths were successfully assigned before cleanup
         for path in [input_path, output_path]:
-            if os.path.exists(path):
+            if path and os.path.exists(path):
                 os.remove(path)
                 app.logger.info(f"Cleaned up {path}")
 
-# Note: Render provides the PORT environment variable, which Gunicorn will use.
-# if __name__ == '__main__':
-#     app.run(debug=True, port=8080)
-
+# Run Block for Local Development
+if __name__ == '__main__':
+    # Correctly reads the PORT environment variable set by hosting services (like Render)
+    # or defaults to 5000 for local development.
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
